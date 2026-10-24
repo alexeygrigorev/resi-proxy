@@ -1,0 +1,7 @@
+{
+  "name": "resi-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {"proxy-chain": "2.7.1"}
+}

@@ -1,0 +1,7 @@
+[Unit]
+Description=Check residential proxy %i every three minutes
+[Timer]
+OnActiveSec=3min
+OnUnitActiveSec=3min
+[Install]
+WantedBy=timers.target

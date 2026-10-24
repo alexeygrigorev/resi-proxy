@@ -1,0 +1,9 @@
+[Unit]
+Description=Check requested exit country for residential proxy %i
+After=resi-proxy@%i.service
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=@PYTHON@ @ROOT@/bin/proxy watchdog %i
+TimeoutStartSec=4min
+NoNewPrivileges=true

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Local residential proxy instances. Credentials never enter argv or systemd units."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import shlex
+import socket
+import subprocess
+import sys
+import time
+from urllib.parse import quote, urlsplit
+
+HOME_DIR = Path(os.environ.get('RESI_PROXY_HOME', pwd.getpwuid(os.getuid()).pw_dir))
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = Path(os.environ.get('RESI_PROXY_CONFIG', HOME_DIR / '.config/resi-proxy'))
+ENV_FILE = Path(os.environ.get('RESI_PROXY_ENV_FILE', HOME_DIR / '.config/youtube/.env'))
+
+
+def private_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(path.name + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, 'w') as out:
+        out.write(value)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(name):
+    CONFIG.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (CONFIG / name).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def systemctl(*args, check=True):
+    return subprocess.run(['systemctl', '--user', *args], check=check,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def unit(name, watchdog=False, timer=False):
+    return f'resi-proxy{"-watchdog" if watchdog else ""}@{name}.{"timer" if timer else "service"}'
+
+
+def active(name):
+    return systemctl('is-active', '--quiet', unit(name), check=False).returncode == 0
+
+
+def instances():
+    return [json.loads(p.read_text()) for p in sorted(CONFIG.glob('*/config.json'))]
+
+
+def get(name):
+    if not re.fullmatch(r'[a-z]{2}(?:-[a-z0-9]+)*', name):
+        raise ValueError('invalid instance name')
+    path = CONFIG / name / 'config.json'
+    if not path.exists():
+        raise ValueError('unknown instance: ' + name)
+    return json.loads(path.read_text())
+
+
+def credentials():
+    values = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            words = shlex.split(line, comments=True)
+            if words and words[0] == 'export':
+                words.pop(0)
+            if words and '=' in words[0]:
+                key, value = words[0].split('=', 1)
+                values[key] = value
+    for key in ('DATAIMPULSE_USER', 'DATAIMPULSE_PASSWORD', 'DATAIMPULSE_ENDPOINT'):
+        if key in os.environ:
+            values[key] = os.environ[key]
+    if not values.get('DATAIMPULSE_USER') or not values.get('DATAIMPULSE_PASSWORD'):
+        raise ValueError('missing DATAIMPULSE_USER / DATAIMPULSE_PASSWORD in environment or env file')
+    endpoint = values.get('DATAIMPULSE_ENDPOINT', 'gw.dataimpulse.com:823')
+    parsed = urlsplit(endpoint if '://' in endpoint else 'http://' + endpoint)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.path not in ('', '/') or parsed.query or parsed.fragment:
+        raise ValueError('DATAIMPULSE_ENDPOINT must be a host:port or HTTP(S) origin without credentials')
+    try:
+        port = parsed.port or 823
+    except ValueError:
+        raise ValueError('invalid endpoint port') from None
+    return values['DATAIMPULSE_USER'], values['DATAIMPULSE_PASSWORD'], f'{parsed.scheme}://{parsed.hostname}:{port}'
+
+
+def rotate(config):
+    login, password, endpoint = credentials()
+    params = ['cr.' + config['country']]
+    for key in ('state', 'city'):
+        if config.get(key):
+            params.append(key + '.' + config[key])
+    # Non-sticky instances use the rotating gateway without a session label.
+    # A rotate still reloads credentials; sticky instances receive a fresh session.
+    if config['sticky']:
+        params += ['sessid.' + secrets.token_hex(12), 'sessttl.' + str(config['ttl'])]
+    scheme, host = endpoint.split('://', 1)
+    url = f'{scheme}://{quote(login + "__" + ";".join(params), safe="")}:{quote(password, safe="")}@{host}\n'
+    private_write(CONFIG / config['name'] / 'upstream.url', url)
+
+
+def location(config):
+    return '/'.join(filter(None, (config['country'].upper(), config.get('state'), config.get('city'))))
+
+
+def probe(config):
+    result = subprocess.run(['curl', '--silent', '--show-error', '--max-time', '20',
+                             '--noproxy', '', '--proxy', f'http://127.0.0.1:{config["port"]}',
+                             '--write-out', '\n%{http_code}', 'https://ipinfo.io/json'],
+                            capture_output=True, text=True)
+    body, _, code = result.stdout.rpartition('\n')
+    if result.returncode == 0 and code == '200':
+        try:
+            data = json.loads(body)
+            if data.get('ip') and data.get('country'):
+                return dict(ip=data['ip'], country=data['country'], region=data.get('region', ''),
+                            city=data.get('city', ''), result='OK' if data['country'] == config['country'].upper() else 'MISMATCH')
+        except (ValueError, TypeError):
+            pass
+    error = 'EXIT_CHECK_FAILED'
+    if 'NO_RAY' in result.stdout or 'NO_RAY' in result.stderr:
+        error = 'NO_RAY: no IP available for requested geo'
+    failpath = CONFIG / config['name'] / 'failure.json'
+    if failpath.exists():
+        try:
+            failure = json.loads(failpath.read_text())
+            if time.time() - failure['time'] < 30:
+                error = failure['code']
+        except (ValueError, KeyError):
+            pass
+    return dict(ip='-', country='-', region='-', city='-', result='ERROR', error=error)
+
+
+def watchdog(config, attempts=8):
+    with locked(config['name'] + '.lock'):
+        for attempt in range(attempts):
+            if not active(config['name']):
+                print(config['name'] + ': service inactive')
+                return 1
+            data = probe(config)
+            print(config['name'] + ': ' + json.dumps(data), flush=True)
+            if data['result'] == 'OK':
+                private_write(CONFIG / config['name'] / 'last-ok.json', json.dumps(data))
+                return 0
+            if attempt + 1 < attempts:
+                rotate(config)
+                print(config['name'] + ': rotated upstream session', flush=True)
+                time.sleep(1)
+        print(config['name'] + ': no matching exit after bounded retries', flush=True)
+        return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    subs = parser.add_subparsers(dest='command', required=True)
+    up = subs.add_parser('up')
+    up.add_argument('--country', required=True, type=str.lower)
+    geo = up.add_mutually_exclusive_group()
+    geo.add_argument('--state', type=str.lower)
+    geo.add_argument('--city', type=str.lower)
+    up.add_argument('--sticky', action='store_true')
+    up.add_argument('--port', type=int)
+    up.add_argument('--ttl', type=int, default=120)
+    up.add_argument('--prepare', action='store_true', help='write config without starting services')
+    listing = subs.add_parser('list')
+    listing.add_argument('--ports', action='store_true', help='only ports of active services, one per line')
+    listing.add_argument('--json', action='store_true')
+    for verb in ('status', 'down', 'rotate', 'watchdog'):
+        sub = subs.add_parser(verb)
+        sub.add_argument('name', nargs='?')
+        if verb == 'status':
+            sub.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    if args.command == 'up':
+        if not re.fullmatch('[a-z]{2}', args.country):
+            raise ValueError('country must be a two-letter code')
+        for value in (args.state, args.city):
+            if value and not re.fullmatch('[a-z0-9]+(?:-[a-z0-9]+)*', value):
+                raise ValueError('state/city must be a lowercase location slug')
+        if not 1 <= args.ttl <= 120:
+            raise ValueError('ttl must be 1–120 minutes')
+        name = args.country + ('-state-' + args.state if args.state else '-city-' + args.city if args.city else '')
+        with locked('instances.lock'):
+            existing = instances()
+            old = next((c for c in existing if c['name'] == name), None)
+            port = args.port if args.port is not None else (old['port'] if old else next((p for p in range(18100, 19000) if all(c['port'] != p for c in existing)), None))
+            if not port or not 1024 <= port <= 65535:
+                raise ValueError('port must be 1024–65535')
+            if any(c['port'] == port and c['name'] != name for c in existing):
+                raise ValueError('port already assigned to another instance')
+            config = dict(name=name, country=args.country, state=args.state, city=args.city,
+                          sticky=args.sticky, ttl=args.ttl, port=port)
+            if old and active(name) and old != config:
+                raise ValueError('down the instance before changing its configuration')
+            if not args.prepare and not active(name):
+                with socket.socket() as sock:
+                    try:
+                        sock.bind(('127.0.0.1', port))
+                    except OSError:
+                        raise ValueError('port is already in use; stop its owner before activation') from None
+            # Validate credentials before committing config.
+            credentials()
+            if not old or old != config or not (CONFIG / name / 'upstream.url').exists():
+                rotate(config)
+            private_write(CONFIG / name / 'config.json', json.dumps(config, indent=2) + '\n')
+            if args.prepare:
+                print(f'{name}: prepared port={port}')
+                return 0
+            systemctl('enable', '--now', unit(name))
+            systemctl('enable', '--now', unit(name, True, True))
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+                        break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError('service did not bind its local port') from None
+                    time.sleep(0.1)
+            if watchdog(config):
+                raise ValueError('matching exit unavailable; service remains active for watchdog recovery')
+        print(f'{name}: active port={port}')
+        return 0
+    configs = [get(args.name)] if getattr(args, 'name', None) else instances()
+    if args.command == 'list':
+        rows = [dict(c, active=active(c['name']), targeting_cost='2x' if c.get('state') or c.get('city') else '1x') for c in configs]
+        if args.ports:
+            for c in rows:
+                if c['active']:
+                    print(c['port'])
+        elif args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            print('NAME PORT LOCATION STICKY TARGETING ACTIVE')
+            for c in rows:
+                print(c['name'], c['port'], location(c), c['sticky'], c['targeting_cost'], c['active'])
+        return 0
+    if args.command == 'status':
+        rows = []
+        for c in configs:
+            running = active(c['name'])
+            data = probe(c) if running else dict(ip='-', country='-', region='-', city='-', result='DOWN')
+            rows.append(dict(name=c['name'], port=c['port'], location=location(c), **data))
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            for row in rows:
+                print('{name} port={port} location={location} exit={ip} country={country} region={region} city={city} {result}'.format(**row) + (' ' + row['error'] if row.get('error') else ''))
+        return int(any(row['result'] != 'OK' for row in rows))
+    failed = 0
+    for c in configs:
+        if args.command == 'down':
+            systemctl('disable', '--now', unit(c['name'], True, True))
+            systemctl('stop', unit(c['name'], True), check=False)
+            systemctl('disable', '--now', unit(c['name']))
+            print(c['name'] + ': stopped; config retained')
+        elif args.command == 'rotate':
+            with locked(c['name'] + '.lock'):
+                rotate(c)
+            if not c['sticky']:
+                print(c['name'] + ': rotating mode already requests a fresh upstream per connection')
+            failed |= watchdog(c)
+        elif args.command == 'watchdog':
+            failed |= watchdog(c)
+    return failed
+
+
+if __name__ == '__main__':
+    os.umask(0o077)
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        # Exceptions from subprocesses/credentials must never expose secrets.
+        message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__ + ': operation failed'
+        print('proxy: ' + message, file=sys.stderr)
+        sys.exit(1)

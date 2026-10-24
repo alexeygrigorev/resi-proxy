@@ -1,0 +1,14 @@
+[Unit]
+Description=Residential proxy %i (loopback only)
+After=network-online.target
+[Service]
+Environment=RESI_INSTANCE_DIR=%h/.config/resi-proxy/%i
+Environment=UV_THREADPOOL_SIZE=1
+UMask=0077
+ExecStart=@NODE@ --v8-pool-size=1 @ROOT@/lib/forwarder.mjs
+Restart=always
+RestartSec=2
+TimeoutStopSec=5
+NoNewPrivileges=true
+[Install]
+WantedBy=default.target
