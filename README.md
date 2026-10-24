@@ -1,6 +1,6 @@
 # resi-proxy
 
-Private residential HTTP proxy service for Hetzner, with per-location systemd user
+Residential HTTP proxy service for Hetzner, with per-location systemd user
 units and one reconnecting SSH tunnel on the Grok Bot box. The local endpoints are
 unauthenticated and bind **127.0.0.1 only**. Keep them private.
 
